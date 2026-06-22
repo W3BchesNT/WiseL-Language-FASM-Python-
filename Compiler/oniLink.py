@@ -38,7 +38,33 @@ importlib.reload(oniConditions)
 importlib.reload(RegEdit)
 
 USER_PROFILE = os.environ.get("USERPROFILE", "")
-FASM_PATH = os.path.join(USER_PROFILE, "Desktop", "FASM", "fasm.exe") if os.path.exists(os.path.join(USER_PROFILE, "Desktop", "FASM", "fasm.exe")) else r"C:\fasm\fasm.exe"
+
+def _find_fasm():
+    for name in ("fasm", "fasm.exe", "fasmw", "fasmw.exe"):
+        path = shutil.which(name)
+        if path:
+            return path
+    candidates = [
+        os.path.join(USER_PROFILE, "Desktop", "FASM", "fasm.exe"),
+        r"C:\fasm\fasm.exe",
+    ]
+    import glob as _glob
+    for pattern in (r"C:\Program Files\fasm*\fasm.exe", r"C:\Program Files\fasm*\FASM.EXE",
+                    r"C:\Program Files (x86)\fasm*\fasm.exe"):
+        matches = _glob.glob(pattern)
+        if matches:
+            candidates.insert(0, matches[0])
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    return r"C:\fasm\fasm.exe"
+
+FASM_PATH = _find_fasm()
+if not os.path.exists(FASM_PATH):
+    print(f"[ERROR] FASM not found. Checked PATH, '{os.path.join(USER_PROFILE, 'Desktop', 'FASM', 'fasm.exe')}', 'C:\\fasm\\fasm.exe'")
+    print("[ERROR] Install FASM and add it to PATH, or place fasm.exe in one of the locations above.")
+    sys.exit(1)
+
 INPUT_FILE = os.path.join("..", "main.wise") if os.path.exists(os.path.join("..", "main.wise")) else "main.wise"
 ASM_FILE, EXE_FILE = "out.asm", "main.exe"
 
