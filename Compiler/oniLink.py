@@ -68,26 +68,75 @@ if not os.path.exists(FASM_PATH):
 INPUT_FILE = os.path.join("..", "main.wise") if os.path.exists(os.path.join("..", "main.wise")) else "main.wise"
 ASM_FILE, EXE_FILE = "out.asm", "main.exe"
 
+def _parse_dll_func_sig(sig):
+    """Parse 'FuncName(type name, ...) -> rettype' into a dict."""
+    import re
+    m = re.match(r'(\w+)\s*\(([^)]*)\)\s*(?:->\s*(\w+))?', sig.strip())
+    if not m:
+        return None
+    fname = m.group(1)
+    params_raw = m.group(2).strip()
+    ret_type = m.group(3) or "void"
+    params = []
+    if params_raw:
+        for p in params_raw.split(","):
+            p = p.strip()
+            if not p:
+                continue
+            parts = p.split()
+            ptype = parts[0]
+            pname = parts[1] if len(parts) > 1 else f"arg{len(params)}"
+            params.append({"ptype": ptype, "pname": pname})
+    return {"name": fname, "params": params, "ret": ret_type}
+
+def _dll_label(dll_name):
+    """Convert 'kernel32.dll' → 'kernel32' as a safe FASM label."""
+    import re
+    base = dll_name.lower()
+    base = re.sub(r'\.(dll|so|dylib)$', '', base)
+    return re.sub(r'[^a-z0-9]', '_', base)
+
 def parse_console_code(code):
     import re
     commands = []
     variables = {}
     lines = code.splitlines()
     i = 0
-    
+
     while i < len(lines):
         line = lines[i].strip()
-        
+
         if not line or line.startswith("Use") or line.startswith("init") or line.startswith("reg.") or line.startswith("#"):
             i += 1
             continue
-        
+
+        # import "dll.dll":
+        #     FuncName(type param) -> rettype
+        m = re.match(r'import\s+"([^"]+)"\s*:', line)
+        if m:
+            dll_name = m.group(1)
+            funcs = []
+            i += 1
+            while i < len(lines):
+                func_line = lines[i]
+                # Stop when line is not indented (back to top level)
+                if func_line and func_line[0] not in (' ', '\t'):
+                    break
+                sig = func_line.strip()
+                if sig and not sig.startswith("#"):
+                    fd = _parse_dll_func_sig(sig)
+                    if fd:
+                        funcs.append(fd)
+                i += 1
+            commands.append({"type": "dll_import", "dll": dll_name, "funcs": funcs})
+            continue
+
         m = re.match(r'run\s+(.+)', line)
         if m:
             commands.append({"type": "sys_run", "cmd": m.group(1).strip()})
             i += 1
             continue
-        
+
         m = re.match(r'string\s+(\w+)\s*=\s*"(.*?)"', line)
         if m:
             var_name = m.group(1)
@@ -95,7 +144,7 @@ def parse_console_code(code):
             variables[var_name] = {"type": "string", "value": var_value}
             i += 1
             continue
-        
+
         m = re.match(r'string\s+(\w+)\s*=\s*input\("(.*?)"\)', line)
         if m:
             var_name = m.group(1)
@@ -104,7 +153,7 @@ def parse_console_code(code):
             commands.append({"type": "sys_input", "var": var_name, "v_type": "string", "prompt": prompt})
             i += 1
             continue
-        
+
         m = re.match(r'int\s+(\w+)\s*=\s*input\("(.*?)"\)', line)
         if m:
             var_name = m.group(1)
@@ -113,7 +162,7 @@ def parse_console_code(code):
             commands.append({"type": "sys_input_int", "var": var_name, "prompt": prompt})
             i += 1
             continue
-        
+
         m = re.match(r'int\s+(\w+)\s*=\s*(\d+)', line)
         if m:
             var_name = m.group(1)
@@ -121,7 +170,39 @@ def parse_console_code(code):
             variables[var_name] = {"type": "int", "value": var_value}
             i += 1
             continue
-        
+
+        # int var = call FuncName(args)
+        m = re.match(r'int\s+(\w+)\s*=\s*call\s+(\w+)\s*\(([^)]*)\)', line)
+        if m:
+            ret_var, func_name = m.group(1), m.group(2)
+            args = [a.strip() for a in m.group(3).split(",") if a.strip()]
+            variables[ret_var] = {"type": "runtime_int", "value": 0}
+            commands.append({"type": "dll_call", "func": func_name, "args": args,
+                             "ret_var": ret_var, "ret_type": "int"})
+            i += 1
+            continue
+
+        # string var = call FuncName(args)  — return value treated as char* pointer
+        m = re.match(r'string\s+(\w+)\s*=\s*call\s+(\w+)\s*\(([^)]*)\)', line)
+        if m:
+            ret_var, func_name = m.group(1), m.group(2)
+            args = [a.strip() for a in m.group(3).split(",") if a.strip()]
+            variables[ret_var] = {"type": "runtime_str", "value": ""}
+            commands.append({"type": "dll_call", "func": func_name, "args": args,
+                             "ret_var": ret_var, "ret_type": "string"})
+            i += 1
+            continue
+
+        # call FuncName(args)
+        m = re.match(r'call\s+(\w+)\s*\(([^)]*)\)', line)
+        if m:
+            func_name = m.group(1)
+            args = [a.strip() for a in m.group(2).split(",") if a.strip()]
+            commands.append({"type": "dll_call", "func": func_name, "args": args,
+                             "ret_var": None, "ret_type": None})
+            i += 1
+            continue
+
         m = re.match(r'print\s+(.+)', line)
         if m:
             content = m.group(1).strip()
@@ -142,31 +223,31 @@ def parse_console_code(code):
                     commands.append({"type": "print_var", "var": var_name})
             i += 1
             continue
-        
+
         if line.startswith("if"):
             is_cond, cond_info = oniConditions.parse_line(line, variables)
             if is_cond:
                 commands.append(cond_info)
                 i += 1
                 continue
-        
+
         if line.startswith("} else {"):
             commands.append({"type": "else_start"})
             i += 1
             continue
-        
+
         if line == "}":
             commands.append({"type": "block_end"})
             i += 1
             continue
-        
+
         if line == "pause":
             commands.append({"type": "sys_pause"})
             i += 1
             continue
-        
+
         i += 1
-    
+
     return commands, variables
 
 def build_console_asm(commands, variables, code):
@@ -175,6 +256,7 @@ def build_console_asm(commands, variables, code):
     data_lines = ["num_fmt db '%d',0"]
     code_lines = [
         "start:",
+        "    and rsp, -16",
         "    invoke SetConsoleOutputCP, 65001",
         "    invoke GetStdHandle, STD_OUTPUT_HANDLE",
         "    mov rbx, rax",
@@ -284,6 +366,46 @@ def build_console_asm(commands, variables, code):
                     f"    invoke WriteFile, rbx, var_{var_name}, [var_{var_name}_len], written_{i}, 0",
                     f"    invoke WriteFile, rbx, crlf_{i}, 2, written_{i}, 0"
                 ]
+            elif var_info.get('type') == 'runtime_int':
+                # Format 64-bit int to string via sprintf, then print
+                if f"var_{var_name} dq 0" not in data_lines:
+                    data_lines.append(f"var_{var_name} dq 0")
+                data_lines.append(f"rtbuf_{i} db 32 dup (0)")
+                data_lines.append(f"rtbuf_{i}_len dq 0")
+                data_lines.append(f"written_{i} dq 0")
+                data_lines.append(f"crlf_{i} db 13,10")
+                data_lines.append(f"fmt_int_{i} db '%lld',0")
+                code_lines += [
+                    f"    sub rsp, 40",
+                    f"    lea rcx, [rtbuf_{i}]",
+                    f"    lea rdx, [fmt_int_{i}]",
+                    f"    mov r8, [var_{var_name}]",
+                    f"    call [crt_sprintf]",
+                    f"    add rsp, 40",
+                    f"    sub rsp, 40",
+                    f"    lea rcx, [rtbuf_{i}]",
+                    f"    call [crt_strlen]",
+                    f"    add rsp, 40",
+                    f"    mov [rtbuf_{i}_len], rax",
+                    f"    invoke WriteFile, rbx, rtbuf_{i}, [rtbuf_{i}_len], written_{i}, 0",
+                    f"    invoke WriteFile, rbx, crlf_{i}, 2, written_{i}, 0",
+                ]
+            elif var_info.get('type') == 'runtime_str':
+                # rax holds a char* pointer; use strlen then WriteFile
+                if f"var_{var_name} dq 0" not in data_lines:
+                    data_lines.append(f"var_{var_name} dq 0")
+                data_lines.append(f"rslen_{i} dq 0")
+                data_lines.append(f"written_{i} dq 0")
+                data_lines.append(f"crlf_{i} db 13,10")
+                code_lines += [
+                    f"    sub rsp, 40",
+                    f"    mov rcx, [var_{var_name}]",
+                    f"    call [crt_strlen]",
+                    f"    add rsp, 40",
+                    f"    mov [rslen_{i}], rax",
+                    f"    invoke WriteFile, rbx, [var_{var_name}], [rslen_{i}], written_{i}, 0",
+                    f"    invoke WriteFile, rbx, crlf_{i}, 2, written_{i}, 0",
+                ]
             else:
                 text = var_info.get('value', '')
                 data_lines.append(f"var_{i} db '{text}',13,10")
@@ -340,23 +462,109 @@ def build_console_asm(commands, variables, code):
                 f"    mov rsi, rax",
                 f"    invoke ReadConsoleA, rsi, pause_read_{i}, 1, pause_read_{i}, 0"
             ]
-    
+
+        elif cmd['type'] == 'dll_import':
+            pass  # handled in import section builder
+
+        elif cmd['type'] == 'dll_call':
+            func_name = cmd['func']
+            args = cmd['args']
+            ret_var = cmd.get('ret_var')
+            ret_type = cmd.get('ret_type')
+
+            invoke_args = []
+            for j, arg in enumerate(args):
+                if arg.startswith('[') and arg.endswith(']'):
+                    vname = arg[1:-1]
+                    vinfo = variables.get(vname, {})
+                    vtype = vinfo.get('type', '')
+                    if vtype == 'int':
+                        # compile-time constant — embed value directly
+                        invoke_args.append(str(vinfo.get('value', 0)))
+                    elif vtype == 'runtime_int':
+                        invoke_args.append(f"[var_{vname}]")
+                    else:
+                        # string, input_string, runtime_str — pass address
+                        invoke_args.append(f"var_{vname}")
+                elif arg.startswith('"') and arg.endswith('"'):
+                    str_val = arg[1:-1]
+                    lbl = f"dllarg_{i}_{j}"
+                    data_lines.append(f"{lbl} db '{str_val}',0")
+                    invoke_args.append(lbl)
+                else:
+                    # bare integer literal or symbol
+                    invoke_args.append(arg)
+
+            if invoke_args:
+                code_lines.append(f"    invoke {func_name}, {', '.join(invoke_args)}")
+            else:
+                code_lines.append(f"    invoke {func_name}")
+
+            if ret_var:
+                if f"var_{ret_var} dq 0" not in data_lines:
+                    data_lines.append(f"var_{ret_var} dq 0")
+                if ret_type == "int":
+                    code_lines.append(f"    mov [var_{ret_var}], rax")
+                elif ret_type == "string":
+                    code_lines.append(f"    mov [var_{ret_var}], rax")
+
+
     code_lines.append("    invoke ExitProcess, 0")
-    
-    # Собираем секцию импортов
-    libs = "kernel32, 'KERNEL32.DLL', msvcrt, 'msvcrt.dll'"
-    funcs = "import kernel32, GetStdHandle, 'GetStdHandle', WriteFile, 'WriteFile', ReadConsoleA, 'ReadConsoleA', SetConsoleOutputCP, 'SetConsoleOutputCP', ExitProcess, 'ExitProcess', WaitForSingleObject, 'WaitForSingleObject', CloseHandle, 'CloseHandle'\nimport msvcrt, crt_sscanf, 'sscanf', crt_sprintf, 'sprintf', crt_strlen, 'strlen', crt_system, 'system'"
-    
-    # Добавляем advapi32 и user32 если есть reg команды
+
+    # Строим секцию импортов через dict чтобы не дублировать DLL
+    # Формат: { label: {"dll": "NAME.DLL", "funcs": ["Fn, 'Fn'", ...]} }
+    import_map = {
+        "kernel32": {
+            "dll": "KERNEL32.DLL",
+            "funcs": ["GetStdHandle, 'GetStdHandle'", "WriteFile, 'WriteFile'",
+                      "ReadConsoleA, 'ReadConsoleA'", "SetConsoleOutputCP, 'SetConsoleOutputCP'",
+                      "ExitProcess, 'ExitProcess'", "WaitForSingleObject, 'WaitForSingleObject'",
+                      "CloseHandle, 'CloseHandle'"],
+        },
+        "msvcrt": {
+            "dll": "msvcrt.dll",
+            "funcs": ["crt_sscanf, 'sscanf'", "crt_sprintf, 'sprintf'",
+                      "crt_strlen, 'strlen'", "crt_system, 'system'"],
+        },
+    }
+
     if reg_commands:
-        libs += ", advapi32, 'ADVAPI32.DLL', user32, 'USER32.DLL'"
-        funcs += "\nimport advapi32, RegOpenKeyExA, 'RegOpenKeyExA', RegSetValueExA, 'RegSetValueExA', RegCloseKey, 'RegCloseKey'\nimport user32, SendMessageTimeoutA, 'SendMessageTimeoutA'"
-    
-    # Добавляем shell32 только если есть sys_run
-    has_run = any(cmd['type'] == 'sys_run' for cmd in commands)
-    if has_run:
-        libs += ", shell32, 'shell32.dll'"
-        funcs += "\nimport shell32, ShellExecuteExA, 'ShellExecuteExA'"
+        import_map["advapi32"] = {
+            "dll": "ADVAPI32.DLL",
+            "funcs": ["RegOpenKeyExA, 'RegOpenKeyExA'", "RegSetValueExA, 'RegSetValueExA'",
+                      "RegCloseKey, 'RegCloseKey'"],
+        }
+        import_map["user32"] = {
+            "dll": "USER32.DLL",
+            "funcs": ["SendMessageTimeoutA, 'SendMessageTimeoutA'"],
+        }
+
+    if any(cmd['type'] == 'sys_run' for cmd in commands):
+        import_map["shell32"] = {
+            "dll": "shell32.dll",
+            "funcs": ["ShellExecuteExA, 'ShellExecuteExA'"],
+        }
+
+    # Пользовательские DLL: добавляем функции в существующую запись или создаём новую
+    for cmd in commands:
+        if cmd['type'] != 'dll_import' or not cmd['funcs']:
+            continue
+        label = _dll_label(cmd['dll'])
+        new_pairs = [f"{f['name']}, '{f['name']}'" for f in cmd['funcs']]
+        if label in import_map:
+            existing = {p.split(",")[0].strip() for p in import_map[label]["funcs"]}
+            for pair in new_pairs:
+                fn = pair.split(",")[0].strip()
+                if fn not in existing:
+                    import_map[label]["funcs"].append(pair)
+                    existing.add(fn)
+        else:
+            import_map[label] = {"dll": cmd['dll'], "funcs": new_pairs}
+
+    lib_parts = [f"{lbl}, '{info['dll']}'" for lbl, info in import_map.items()]
+    func_lines = [f"import {lbl}, {', '.join(info['funcs'])}" for lbl, info in import_map.items()]
+    libs = ", ".join(lib_parts)
+    funcs = "\n".join(func_lines)
     
     return f"""format PE64 CONSOLE
 entry start

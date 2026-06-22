@@ -1,8 +1,13 @@
 Use ConsoleX64
 
+import "kernel32.dll":
+    Sleep(int ms) -> void
+
+import "user32.dll":
+    MessageBoxA(int hwnd, string text, string caption, int flags) -> int
+
 init main:
-    int a = 10
-    int b = 20
-    print [a]
-    print [b]
-    pause
+    int delay = 2000
+    print [delay]
+    call Sleep([delay])
+    call MessageBoxA(0, "Hi", "T", 0)
